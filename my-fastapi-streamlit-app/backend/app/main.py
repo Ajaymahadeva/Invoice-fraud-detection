@@ -12,6 +12,7 @@ import tempfile
 import traceback
 import math
 import logging
+from datetime import datetime
 
 # =========================================================
 # BASIC SETUP
@@ -32,27 +33,36 @@ app.add_middleware(
 )
 
 # =========================================================
-# TESSERACT CONFIG (USE YOUR ACTUAL PATH)
+# TESSERACT CONFIG (DYNAMIC PATH)
 # =========================================================
 
-TESSERACT_PATH = r"D:\project\tesseractmode\tesseract.exe"
+# Resolve project root dynamically
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../"))
+TESSERACT_PATH = os.path.join(BASE_DIR, "tesseractmode", "tesseract.exe")
 
 try:
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
     pytesseract.get_tesseract_version()
     logger.info(f"Tesseract configured successfully: {TESSERACT_PATH}")
 except Exception as e:
-    logger.error("Tesseract configuration failed")
-    raise RuntimeError("Tesseract OCR not configured correctly")
+    logger.error(f"Tesseract configuration failed: {e}")
+    logger.warning(
+        "Continuing without configured Tesseract; OCR calls may fail. "
+        "Set TESSERACT_PATH or install the tesseract executable to enable OCR."
+    )
 
 # =========================================================
-# CONSTANTS
+# CONSTANTS & DATA DIRS
 # =========================================================
 
 GSTIN_REGEX = r"^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$"
 
-PROCESSED_JSON = "processed_invoices.json"
-VENDOR_HISTORY_JSON = "vendor_history.json"
+DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+PROCESSED_JSON = os.path.join(DATA_DIR, "processed_invoices.json")
+VENDOR_HISTORY_JSON = os.path.join(DATA_DIR, "vendor_history.json")
+STATS_JSON = os.path.join(DATA_DIR, "stats.json")
 
 # =========================================================
 # UTIL FUNCTIONS
@@ -139,37 +149,34 @@ async def analyze_invoice(file: UploadFile = File(...)):
             tmp_path = tmp.name
 
         # -------------------------
-        # LOAD IMAGE
+        # LOAD IMAGE & PREPROCESS (OpenCV)
         # -------------------------
         image = Image.open(tmp_path).convert("RGB")
         img_np = np.array(image)
         gray = cv2.cvtColor(img_np, cv2.COLOR_BGR2GRAY)
+        
+        # Binarization and noise reduction to improve OCR accuracy
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        processed_img = cv2.adaptiveThreshold(
+            blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+        )
 
         # -------------------------
         # OCR (SAFE)
         # -------------------------
         try:
-            ocr_text = pytesseract.image_to_string(gray)
+            ocr_text = pytesseract.image_to_string(processed_img)
         except Exception:
-            return {
-                "status": "rejected",
-                "reason": "OCR engine failed to read the image"
-            }
+            raise HTTPException(status_code=400, detail="OCR engine failed to read the image")
 
         if not ocr_text or not ocr_text.strip():
-            return {
-                "status": "rejected",
-                "reason": "No readable text found in image"
-            }
+            raise HTTPException(status_code=400, detail="No readable text found in image. Please upload a clear document.")
 
         # -------------------------
         # INVOICE CHECK
         # -------------------------
         if not looks_like_invoice(ocr_text):
-            return {
-                "status": "rejected",
-                "reason": "It is not an invoice image"
-            }
+            raise HTTPException(status_code=400, detail="Document rejected: It does not appear to be a valid invoice based on its contents.")
 
         # -------------------------
         # EXTRACT FIELDS
@@ -184,10 +191,12 @@ async def analyze_invoice(file: UploadFile = File(...)):
 
         processed = set(load_json(PROCESSED_JSON, []))
         history = load_json(VENDOR_HISTORY_JSON, {})
+        stats = load_json(STATS_JSON, {"total_processed": 0, "high_risk": 0, "medium_risk": 0, "low_risk": 0})
 
         inv_no = fields["invoice_number"]
         amount = fields["amount_total"]
         tax_id = fields["tax_id"]
+        inv_date_str = fields["invoice_date"]
 
         if not inv_no:
             flags.append("NO_INVOICE_NUMBER")
@@ -208,18 +217,42 @@ async def analyze_invoice(file: UploadFile = File(...)):
         if amount is None:
             flags.append("NO_TOTAL_AMOUNT")
             risk_score += 10
+        else:
+            # Check for suspiciously round amounts
+            if amount > 0 and amount % 1000 == 0:
+                flags.append("SUSPICIOUS_ROUND_AMOUNT")
+                risk_score += 15
+                
+        # Check for future dates
+        if inv_date_str:
+            try:
+                # Try parsing standard formats like dd/mm/yyyy or dd-mm-yyyy
+                date_format = "%d/%m/%Y" if "/" in inv_date_str else "%d-%m-%Y"
+                inv_date = datetime.strptime(inv_date_str, date_format)
+                if inv_date > datetime.now():
+                    flags.append("FUTURE_DATE_DETECTED")
+                    risk_score += 40
+            except ValueError:
+                flags.append("INVALID_DATE_FORMAT")
+                risk_score += 10
 
         risk_score = min(risk_score, 100)
 
         if risk_score > 60:
             risk_category = "High"
+            stats["high_risk"] += 1
         elif risk_score >= 30:
             risk_category = "Medium"
+            stats["medium_risk"] += 1
         else:
             risk_category = "Low"
+            stats["low_risk"] += 1
+
+        stats["total_processed"] += 1
 
         save_json(PROCESSED_JSON, list(processed))
         save_json(VENDOR_HISTORY_JSON, history)
+        save_json(STATS_JSON, stats)
 
         # -------------------------
         # FINAL RESPONSE
@@ -243,6 +276,8 @@ async def analyze_invoice(file: UploadFile = File(...)):
             }
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(traceback.format_exc())
         return {
@@ -253,3 +288,9 @@ async def analyze_invoice(file: UploadFile = File(...)):
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)
+
+@app.get("/stats")
+async def get_stats():
+    stats = load_json(STATS_JSON, {"total_processed": 0, "high_risk": 0, "medium_risk": 0, "low_risk": 0})
+    return {"status": "success", "data": stats}
+

@@ -2,6 +2,7 @@ import streamlit as st
 import requests
 import re
 import json
+import pandas as pd
 
 st.set_page_config(page_title="Invoice Fraud Detection", layout="wide")
 
@@ -28,12 +29,15 @@ st.markdown("""
 st.title("🧾 Multi-Agent Invoice Fraud Detection System")
 st.subheader("Upload one or more invoice images for anomaly detection and fraud risk analysis.")
 
-# --- File Uploader ---
-uploaded_files = st.file_uploader(
-    "Drag and drop invoice images (.png, .jpg, .jpeg)",
-    type=["png", "jpg", "jpeg"],
-    accept_multiple_files=True
-)
+tab1, tab2 = st.tabs(["Upload & Analysis", "Analytics Dashboard"])
+
+with tab1:
+    # --- File Uploader ---
+    uploaded_files = st.file_uploader(
+        "Drag and drop invoice images (.png, .jpg, .jpeg)",
+        type=["png", "jpg", "jpeg"],
+        accept_multiple_files=True
+    )
 
 # --- Display function ---
 def display_report(uploaded_file, result, label):
@@ -93,43 +97,83 @@ def display_report(uploaded_file, result, label):
 
 
 # --- Main Button Logic ---
-if uploaded_files and st.button("🔍 Analyze Uploaded Invoices"):
-    st.markdown("## 📊 Analysis Results")
+with tab1:
+    if uploaded_files and st.button("🔍 Analyze Uploaded Invoices"):
+        st.markdown("## 📊 Analysis Results")
 
-    cols = st.columns(len(uploaded_files))
+        cols = st.columns(len(uploaded_files))
 
-    for i, uploaded_file in enumerate(uploaded_files):
-        with cols[i]:
-            with st.spinner(f"Analyzing Invoice {i+1}... Please wait ⏳"):
-                uploaded_file.seek(0)
-                files = {"file": (uploaded_file.name, uploaded_file.read(), uploaded_file.type)}
+        for i, uploaded_file in enumerate(uploaded_files):
+            with cols[i]:
+                with st.spinner(f"Analyzing Invoice {i+1}... Please wait ⏳"):
+                    uploaded_file.seek(0)
+                    files = {"file": (uploaded_file.name, uploaded_file.read(), uploaded_file.type)}
 
-                try:
-                    resp = requests.post(
-                        "http://127.0.0.1:8000/analyze_invoice",
-                        files=files,
-                        timeout=120
-                    )
+                    try:
+                        resp = requests.post(
+                            "http://127.0.0.1:8000/analyze_invoice",
+                            files=files,
+                            timeout=120
+                        )
 
-                    if resp.status_code == 200:
-                        result = resp.json()
-                        st.markdown(f"### 🧾 Invoice {i+1} Report")
-                        display_report(uploaded_file, result, f"Invoice {i+1}")
+                        if resp.status_code == 200:
+                            result = resp.json()
+                            st.markdown(f"### 🧾 Invoice {i+1} Report")
+                            display_report(uploaded_file, result, f"Invoice {i+1}")
 
-                    elif resp.status_code == 400:
-                        rejection_message = resp.json().get("detail", "Document rejected: Unknown reason.")
-                        st.error(f"Invoice {i+1} rejected ❌")
-                        st.warning(rejection_message)
+                        elif resp.status_code == 400:
+                            rejection_message = resp.json().get("detail", "Document rejected: Unknown reason.")
+                            st.error(f"Invoice {i+1} rejected ❌")
+                            st.warning(rejection_message)
 
-                    else:
-                        error_detail = resp.json().get("detail", "Unknown server error.")
-                        st.error(f"Invoice {i+1} failed (Error {resp.status_code})")
-                        st.exception(error_detail)
+                        else:
+                            error_detail = resp.json().get("detail", "Unknown server error.")
+                            st.error(f"Invoice {i+1} failed (Error {resp.status_code})")
+                            st.exception(error_detail)
 
-                except requests.exceptions.ConnectionError:
-                    st.error(f"❌ Connection failed for Invoice {i+1}. Is FastAPI backend running?")
-                except Exception as e:
-                    st.error(f"❌ Invoice {i+1} processing failed: {e}")
+                    except requests.exceptions.ConnectionError:
+                        st.error(f"❌ Connection failed for Invoice {i+1}. Is FastAPI backend running?")
+                    except Exception as e:
+                        st.error(f"❌ Invoice {i+1} processing failed: {e}")
+
+with tab2:
+    st.markdown("## 📈 Fraud Analytics Dashboard")
+    st.markdown("Overview of all historical invoice processing data.")
+    
+    if st.button("🔄 Refresh Data"):
+        st.rerun()
+
+    try:
+        resp = requests.get("http://127.0.0.1:8000/stats", timeout=10)
+        if resp.status_code == 200:
+            stats = resp.json().get("data", {})
+            
+            # Key Metrics
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Total Invoices", stats.get("total_processed", 0))
+            m2.metric("High Risk 🚨", stats.get("high_risk", 0))
+            m3.metric("Medium Risk ⚠️", stats.get("medium_risk", 0))
+            m4.metric("Low Risk ✅", stats.get("low_risk", 0))
+            
+            st.markdown("---")
+            
+            # Charts
+            st.markdown("### Risk Distribution")
+            chart_data = pd.DataFrame({
+                "Risk Category": ["High", "Medium", "Low"],
+                "Count": [
+                    stats.get("high_risk", 0), 
+                    stats.get("medium_risk", 0), 
+                    stats.get("low_risk", 0)
+                ]
+            }).set_index("Risk Category")
+            
+            st.bar_chart(chart_data, color="#ff4b4b", height=350)
+            
+        else:
+            st.error("Failed to load dashboard statistics.")
+    except Exception as e:
+        st.error(f"Could not connect to backend to fetch stats: {e}")
 
 st.markdown("---")
 st.caption("Powered by Streamlit ⚡ + FastAPI 🚀 + Tesseract OCR 🧠 + Gemini Vision (optional)")
